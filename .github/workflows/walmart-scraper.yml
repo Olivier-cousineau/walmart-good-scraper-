@@ -32,18 +32,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
+          install-chromedriver: true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Chrome Browser
-        uses: browser-actions/setup-chrome@latest
-
-      - name: Install Chromium (alternative)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser
 
       - name: Install dependencies
         run: |

@@ -11,7 +11,9 @@ import argparse
 import csv
 import json
 import logging
+import os
 import random
+import shutil
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -37,6 +39,41 @@ logging.basicConfig(
 logger = logging.getLogger("walmart_canada_scraper")
 
 
+def _detect_chrome_binary() -> str:
+    """Retourne le chemin du binaire Chrome installé dans l'environnement CI.
+
+    Le workflow GitHub Actions installe Google Chrome stable via
+    `browser-actions/setup-chrome`. Cette fonction cherche explicitement le
+    binaire fourni (google-chrome-stable) et échoue de manière explicite si
+    aucun binaire n'est trouvé pour éviter un démarrage silencieux du driver.
+    """
+
+    # Priorité aux variables d'environnement si l'utilisateur fournit un chemin custom
+    env_candidates = [
+        os.environ.get("CHROME_BINARY"),
+        os.environ.get("GOOGLE_CHROME_SHIM"),
+    ]
+    for candidate in env_candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+
+    # Recherche standard des binaires Chrome/Chromium installés
+    for binary in (
+        "google-chrome-stable",
+        "google-chrome",
+        "chrome",
+        "chromium",
+    ):
+        path = shutil.which(binary)
+        if path:
+            return path
+
+    raise FileNotFoundError(
+        "Chrome introuvable dans l'environnement. Vérifiez que le workflow a exécuté "
+        "l'étape 'Setup Chrome' et que le binaire est présent dans PATH."
+    )
+
+
 def create_driver(headless: bool = True):
     """
     Crée un driver Chrome compatible GitHub Actions (CI) avec undetected_chromedriver.
@@ -44,6 +81,10 @@ def create_driver(headless: bool = True):
 
     try:
         options = uc.ChromeOptions()
+
+        # Garantir que le binaire Chrome installé par le workflow est utilisé
+        chrome_binary = _detect_chrome_binary()
+        options.binary_location = chrome_binary
 
         # ---- FLAGS SPÉCIAUX POUR CI / DOCKER / GITHUB ACTIONS ----
         if headless:
