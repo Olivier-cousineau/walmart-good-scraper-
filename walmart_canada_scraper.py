@@ -13,10 +13,12 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 from selenium import webdriver
@@ -296,6 +298,181 @@ class WalmartCanadaScraper:
             logger.error("Erreur lors du traitement CAPTCHA: %s", exc)
             return False
 
+    def _extract_store_metadata(self, store_url: str):
+        """Extraire store_id, province et slug depuis l'URL/page actuelle."""
+
+        parsed = urlparse(store_url)
+        parts = [part for part in parsed.path.split("/") if part]
+        province = parts[2] if len(parts) >= 3 else ""
+        store_slug = parts[3] if len(parts) >= 4 else ""
+
+        page_source = self.driver.page_source if self.driver else ""
+        store_id = None
+
+        patterns = [
+            r"\"storeId\"\s*:\s*\"?(\d+)\"?",
+            r"data-store-number=\"?(\d+)\"?",
+            r"storeNumber\":\s*\"?(\d+)\"?",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, page_source)
+            if match:
+                store_id = match.group(1)
+                break
+
+        if not store_id and store_slug:
+            slug_match = re.search(r"(\d+)", store_slug)
+            if slug_match:
+                store_id = slug_match.group(1)
+
+        if store_id:
+            logger.info("Store ID détecté: %s", store_id)
+        else:
+            logger.warning("Store ID introuvable dans la page: fallback sur slug")
+
+        return store_id, province, store_slug
+
+    def _normalize_product(self, raw: Dict, store_id: Optional[str], store_slug: str, province: str, promo_hint: str) -> Optional[Dict]:
+        """Normaliser les données produit renvoyées par l'API produit."""
+
+        title = raw.get("name") or raw.get("title") or raw.get("description")
+        product_id = raw.get("id") or raw.get("usItemId") or raw.get("sku") or raw.get("itemId")
+        product_url = raw.get("productPageUrl") or raw.get("canonicalUrl") or raw.get("canonicalUrlKey")
+        if product_url and product_url.startswith("/"):
+            product_url = f"https://www.walmart.ca{product_url}"
+
+        price_candidates = [
+            raw.get("price"),
+            raw.get("currentPrice"),
+            raw.get("sellingPrice"),
+            raw.get("primaryOffer"),
+            raw.get("priceInfo", {}).get("currentPrice"),
+            raw.get("offer", {}),
+        ]
+
+        current_price = None
+        original_price = None
+
+        for candidate in price_candidates:
+            if isinstance(candidate, dict):
+                if current_price is None:
+                    current_price = candidate.get("price") or candidate.get("currentPrice") or candidate.get("amount")
+                if original_price is None:
+                    original_price = (
+                        candidate.get("wasPrice")
+                        or candidate.get("originalPrice")
+                        or candidate.get("compareAtPrice")
+                        or candidate.get("listPrice")
+                    )
+            elif isinstance(candidate, (int, float, str)) and current_price is None:
+                current_price = candidate
+
+        badges = raw.get("badges") or raw.get("tags") or raw.get("categoryTags") or []
+        promo_type = promo_hint
+        if isinstance(badges, list):
+            badge_text = " ".join(str(badge) for badge in badges).lower()
+            if "rollback" in badge_text:
+                promo_type = "rollback"
+            elif "clearance" in badge_text:
+                promo_type = "clearance"
+            elif "deal" in badge_text or "special" in badge_text:
+                promo_type = "deal"
+
+        if not title and not product_url:
+            return None
+
+        return {
+            "store_id": store_id or store_slug,
+            "store_slug": store_slug,
+            "province": province,
+            "product_id": product_id or "",
+            "product_url": product_url or "",
+            "title": title or "",
+            "current_price": current_price,
+            "original_price": original_price,
+            "promo_type": promo_type,
+        }
+
+    def _extract_products_via_api(
+        self, store_id: Optional[str], store_slug: str, province: str, max_pages: int = 2
+    ) -> List[Dict]:
+        """Récupérer les produits en promotion via l'API de recherche produit.
+
+        Walmart ne liste pas les produits directement sur la page magasin. On utilise
+        l'API `product-search/search` avec des requêtes ciblées (rollback/clearance)
+        pour obtenir un échantillon de produits promotionnels par magasin.
+        """
+
+        if not store_id:
+            logger.warning("Aucun store_id disponible pour l'extraction produit")
+            return []
+
+        session = requests.Session()
+        session.trust_env = False
+
+        headers = {
+            "User-Agent": self.get_random_user_agent(),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.walmart.ca/",
+        }
+
+        search_queries = [
+            ("rollback", "rollback"),
+            ("clearance", "clearance"),
+            ("deal", "deal"),
+        ]
+
+        all_products: List[Dict] = []
+        seen_keys = set()
+
+        for query, promo_hint in search_queries:
+            for page in range(1, max_pages + 1):
+                params = {
+                    "page": page,
+                    "query": query,
+                    "storeId": store_id,
+                    "itemsPerPage": 48,
+                    "lang": "en",
+                }
+
+                response = session.get(
+                    "https://www.walmart.ca/api/product-search/search",
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                )
+
+                if response.status_code != 200:
+                    logger.debug(
+                        "Requête API produit échouée (status %s) pour store %s / query %s",
+                        response.status_code,
+                        store_id,
+                        query,
+                    )
+                    break
+
+                payload = response.json()
+                items = payload.get("items") or payload.get("results") or []
+
+                if not items:
+                    logger.info("Aucun produit retourné pour la requête '%s' (page %s)", query, page)
+                    break
+
+                for raw in items:
+                    normalized = self._normalize_product(raw, store_id, store_slug, province, promo_hint)
+                    if normalized:
+                        key = (normalized.get("product_id"), normalized.get("product_url"))
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_products.append(normalized)
+
+                if len(items) < params["itemsPerPage"]:
+                    break
+
+        logger.info("Trouvé %s produits via API", len(all_products))
+        return all_products
+
     def scrape_store_page(self, store_url: str, retry: int = 0) -> Optional[Dict]:
         """Scraper une page de store Walmart avec gestion d'erreurs."""
         try:
@@ -331,45 +508,18 @@ class WalmartCanadaScraper:
                 "products": [],
             }
 
+            store_id, province, store_slug = self._extract_store_metadata(store_url)
+
             try:
                 data["store_name"] = self.driver.find_element(By.XPATH, "//h1").text
             except Exception:
                 data["store_name"] = "N/A"
 
             try:
-                products = self.driver.find_elements(
-                    By.XPATH,
-                    "//div[@class='search-result-gridview-item'] | //div[contains(@class, 'product')]",
-                )
-                logger.info("Trouvé %s produits", len(products))
-
-                for i, product in enumerate(products):
-                    if i >= 20:
-                        break
-                    try:
-                        name_elem = product.find_elements(
-                            By.XPATH, ".//a[@class='product-title'] | .//a[contains(@class, 'product')]"
-                        )
-                        price_elem = product.find_elements(
-                            By.XPATH, ".//span[@class='price'] | .//span[contains(@class, 'price')]"
-                        )
-
-                        if name_elem and price_elem:
-                            data["products"].append(
-                                {
-                                    "name": name_elem[0].text,
-                                    "price": price_elem[0].text,
-                                    "url": name_elem[0].get_attribute("href")
-                                    if name_elem[0].get_attribute("href")
-                                    else "N/A",
-                                }
-                            )
-                    except Exception as exc:
-                        logger.debug("Erreur extraction produit %s: %s", i, exc)
-                        continue
-
+                api_products = self._extract_products_via_api(store_id, store_slug, province)
+                data["products"].extend(api_products)
             except Exception as exc:
-                logger.warning("Erreur lors de l'extraction des produits: %s", exc)
+                logger.warning("Erreur lors de l'extraction des produits via API: %s", exc)
 
             data["product_count"] = len(data["products"])
             logger.info("✓ Page scrapée: %s (%s produits)", data["store_name"], data["product_count"])
