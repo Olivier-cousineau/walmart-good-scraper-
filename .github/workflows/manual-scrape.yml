@@ -35,6 +35,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: true
+          install-chromedriver: true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
