@@ -1,0 +1,80 @@
+name: Manual Walmart Canada scrape
+
+on:
+  workflow_dispatch:
+    inputs:
+      output_file:
+        description: "Nom du fichier CSV de sortie"
+        required: false
+        default: "walmart_canada_results.csv"
+      stores_per_province:
+        description: "Nombre de magasins à scraper par province"
+        required: false
+        default: "5"
+      proxies:
+        description: "Liste de proxies séparés par des virgules"
+        required: false
+        default: ""
+      captcha_api_key:
+        description: "Clé API 2Captcha (optionnelle)"
+        required: false
+        default: ""
+      headless:
+        description: "Exécuter le navigateur en mode headless"
+        type: boolean
+        default: true
+      max_retries:
+        description: "Nombre de tentatives par page"
+        required: false
+        default: "3"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          CAPTCHA_API_KEY: ${{ inputs.captcha_api_key }}
+          PROXIES: ${{ inputs.proxies }}
+        run: |
+          HEADLESS_FLAG="--no-headless"
+          if [ "${{ inputs.headless }}" = "true" ]; then
+            HEADLESS_FLAG="--headless"
+          fi
+
+          python walmart_canada_scraper.py \
+            --output-file "${{ inputs.output_file }}" \
+            --stores-per-province "${{ inputs.stores_per_province }}" \
+            --max-retries "${{ inputs.max_retries }}" \
+            --proxies "$PROXIES" \
+            --captcha-api-key "$CAPTCHA_API_KEY" \
+            $HEADLESS_FLAG
+
+      - name: Préparer les chemins des artefacts
+        run: |
+          OUTPUT_FILE="${{ inputs.output_file }}"
+          JSON_FILE="${OUTPUT_FILE%.csv}.json"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+          echo "JSON_FILE=$JSON_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walmart-canada-scrape
+          path: |
+            ${{ env.OUTPUT_FILE }}
+            ${{ env.JSON_FILE }}
