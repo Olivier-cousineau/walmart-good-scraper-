@@ -1,0 +1,90 @@
+name: Walmart Canada Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      output_file:
+        description: "Nom du fichier CSV de sortie"
+        required: false
+        default: "walmart_canada_results.csv"
+      stores_per_province:
+        description: "Nombre de magasins à scraper par province"
+        required: false
+        default: "2"
+      proxies:
+        description: "Liste de proxies séparés par des virgules"
+        required: false
+        default: ""
+      headless_mode:
+        description: "Exécuter le navigateur en mode headless"
+        type: boolean
+        default: true
+      max_retries:
+        description: "Nombre de tentatives par page"
+        required: false
+        default: "3"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Chrome Browser
+        uses: browser-actions/setup-chrome@latest
+
+      - name: Install Chromium (alternative)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Créer le fichier .env depuis les secrets et inputs
+        run: |
+          cat > .env <<'ENVVARS'
+          CAPTCHA_API_KEY=${{ secrets.CAPTCHA_API_KEY }}
+          PROXIES=${{ inputs.proxies }}
+          STORES_PER_PROVINCE=${{ inputs.stores_per_province }}
+          OUTPUT_FILE=${{ inputs.output_file }}
+          HEADLESS_MODE=${{ inputs.headless_mode }}
+          MAX_RETRIES=${{ inputs.max_retries }}
+          ENVVARS
+
+      - name: Exécuter le scraper
+        env:
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          PROXIES: ${{ inputs.proxies }}
+          STORES_PER_PROVINCE: ${{ inputs.stores_per_province }}
+          OUTPUT_FILE: ${{ inputs.output_file }}
+          HEADLESS_MODE: ${{ inputs.headless_mode }}
+          MAX_RETRIES: ${{ inputs.max_retries }}
+        run: |
+          python github_actions_runner.py
+
+      - name: Préparer les chemins des artefacts
+        run: |
+          OUTPUT_FILE="${{ inputs.output_file }}"
+          JSON_FILE="${OUTPUT_FILE%.csv}.json"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+          echo "JSON_FILE=$JSON_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload des résultats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walmart-canada-scrape
+          path: |
+            ${{ env.OUTPUT_FILE }}
+            ${{ env.JSON_FILE }}
+          if-no-files-found: warn
