@@ -1,5 +1,3 @@
-undetected-chromedriver
 selenium
-selenium-stealth
 requests
 twocaptcha

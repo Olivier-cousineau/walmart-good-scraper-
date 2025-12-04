@@ -1,8 +1,8 @@
 """
 Walmart Canada Scraper - robuste et tout-épreuve.
 
-Ce module fournit un scraper Selenium basé sur undetected-chromedriver avec
-rotation de proxy, contournement CAPTCHA et export CSV/JSON. Il inclut une
+Ce module fournit un scraper Selenium basé sur Chrome/ChromeDriver standards
+avec rotation de proxy, contournement CAPTCHA et export CSV/JSON. Il inclut une
 interface CLI pour lancer un scraping contrôlé par arguments ou via un workflow
 GitHub Actions déclenché manuellement.
 """
@@ -19,8 +19,10 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import requests
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver import Chrome
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -74,13 +76,32 @@ def _detect_chrome_binary() -> str:
     )
 
 
-def create_driver(headless: bool = True):
-    """
-    Crée un driver Chrome compatible GitHub Actions (CI) avec undetected_chromedriver.
-    """
+def _detect_chromedriver_binary() -> str:
+    """Trouver le binaire ChromeDriver installé par `setup-chrome`."""
+
+    env_candidates = [
+        os.environ.get("CHROMEDRIVER_PATH"),
+        os.environ.get("WEBDRIVER_CHROME_DRIVER"),
+    ]
+    for candidate in env_candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+
+    path = shutil.which("chromedriver")
+    if path:
+        return path
+
+    raise FileNotFoundError(
+        "ChromeDriver introuvable. Assurez-vous que l'action 'Setup Chrome' a installé le driver"
+        " et que le chemin est exporté dans CHROMEDRIVER_PATH."
+    )
+
+
+def create_driver(headless: bool = True) -> Chrome:
+    """Créer un driver Chrome compatible GitHub Actions avec Selenium classique."""
 
     try:
-        options = uc.ChromeOptions()
+        options = Options()
 
         # Garantir que le binaire Chrome installé par le workflow est utilisé
         chrome_binary = _detect_chrome_binary()
@@ -88,7 +109,6 @@ def create_driver(headless: bool = True):
 
         # ---- FLAGS SPÉCIAUX POUR CI / DOCKER / GITHUB ACTIONS ----
         if headless:
-            # Headless mode pour Chrome récent
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -97,18 +117,11 @@ def create_driver(headless: bool = True):
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--window-size=1920,1080")
-        options.add_argument("--remote-debugging-port=9222")
 
-        # Réduire la détection d’automatisation
-        options.add_argument("--disable-blink-features=AutomationControlled")
+        logger.info("Création du driver Chrome (Selenium) pour Walmart Canada...")
 
-        logger.info("Création du driver Chrome (undetected_chromedriver) pour Walmart Canada...")
-
-        # IMPORTANT EN CI : éviter le subprocess séparé qui peut mourir immédiatement
-        driver = uc.Chrome(
-            options=options,
-            use_subprocess=False,
-        )
+        service = Service(executable_path=_detect_chromedriver_binary())
+        driver = webdriver.Chrome(service=service, options=options)
 
         driver.set_page_load_timeout(60)
         driver.set_script_timeout(60)
@@ -127,7 +140,7 @@ class WalmartCanadaScraper:
 
     - Bypass CAPTCHA automatique (2Captcha, PerimeterX)
     - Rotation d'IP/proxies résidentiels
-    - Détection anti-bot (undetected-chromedriver + Selenium Stealth)
+    - Durcissement anti-bot via Chrome standard configuré pour la CI
     - Gestion des rate limits et retry
     - Support des 402 stores Walmart Canada
     """
@@ -207,7 +220,7 @@ class WalmartCanadaScraper:
         """Retourner un user agent aléatoire."""
         return random.choice(self.USER_AGENTS)
 
-    def setup_driver(self) -> uc.Chrome:
+    def setup_driver(self) -> Chrome:
         """Configurer le driver Selenium compatible CI."""
 
         return create_driver(headless=self.headless)
@@ -235,7 +248,7 @@ class WalmartCanadaScraper:
         Gérer le CAPTCHA PerimeterX/reCAPTCHA.
 
         Stratégies:
-        1. Attendre que undetected-chromedriver le bypass automatiquement
+        1. Attendre un contournement automatique éventuel
         2. Utiliser 2Captcha si disponible
         3. Attendre l'utilisateur
         """
