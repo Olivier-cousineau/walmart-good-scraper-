@@ -18,13 +18,11 @@ from typing import Dict, List, Optional
 
 import requests
 import undetected_chromedriver as uc
-from selenium import webdriver
 from selenium.webdriver import Chrome
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium_stealth import stealth
 from twocaptcha import TwoCaptcha
 
 # ============ CONFIGURATION LOGGING ============
@@ -36,7 +34,50 @@ logging.basicConfig(
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("walmart_canada_scraper")
+
+
+def create_driver(headless: bool = True):
+    """
+    Crée un driver Chrome compatible GitHub Actions (CI) avec undetected_chromedriver.
+    """
+
+    try:
+        options = uc.ChromeOptions()
+
+        # ---- FLAGS SPÉCIAUX POUR CI / DOCKER / GITHUB ACTIONS ----
+        if headless:
+            # Headless mode pour Chrome récent
+            options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-tools")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--remote-debugging-port=9222")
+
+        # Réduire la détection d’automatisation
+        options.add_argument("--disable-blink-features=AutomationControlled")
+
+        logger.info("Création du driver Chrome (undetected_chromedriver) pour Walmart Canada...")
+
+        # IMPORTANT EN CI : éviter le subprocess séparé qui peut mourir immédiatement
+        driver = uc.Chrome(
+            options=options,
+            use_subprocess=False,
+        )
+
+        driver.set_page_load_timeout(60)
+        driver.set_script_timeout(60)
+
+        logger.info("✓ Driver Chrome initialisé avec succès.")
+        return driver
+
+    except Exception as e:
+        logger.error(f"✗ Erreur lors de la configuration du driver: {e}", exc_info=True)
+        raise
 
 
 class WalmartCanadaScraper:
@@ -126,60 +167,9 @@ class WalmartCanadaScraper:
         return random.choice(self.USER_AGENTS)
 
     def setup_driver(self) -> uc.Chrome:
-        """Configurer le driver Selenium avec toutes les protections anti-détection."""
-        try:
-            logger.info("Configuration du driver Selenium undetected...")
-            options = uc.ChromeOptions()
+        """Configurer le driver Selenium compatible CI."""
 
-            # ============ PROTECTIONS ANTI-DÉTECTION ============
-            # Désactiver les flags d'automation
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("disable-popup-blocking")
-            options.add_argument("--no-first-run")
-
-            # Configuration de base
-            options.add_argument("--start-maximized")
-            options.add_argument(f"user-agent={self.get_random_user_agent()}")
-
-            # Désactiver les éléments suspects
-            options.add_argument("--disable-web-resources")
-            options.add_argument("--disable-plugins")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-sync")
-            options.add_argument("--disable-background-networking")
-            options.add_argument("--disable-client-side-phishing-detection")
-
-            # Mode headless (optionnel)
-            if self.headless:
-                options.add_argument("--headless=new")
-                options.add_argument("--window-size=1920,1080")
-
-            # Proxy rotation
-            proxy = self.rotate_proxy()
-            if proxy:
-                options.add_argument(f"--proxy-server={proxy}")
-                logger.info("Proxy appliqué au driver")
-
-            # Créer le driver undetected
-            driver = uc.Chrome(options=options, version_main=None, suppress_welcome=True)
-
-            # ============ SELENIUM STEALTH ============
-            stealth(
-                driver,
-                languages=["en-US", "en"],
-                vendor="Google Inc.",
-                platform="Win32",
-                webgl_vendor="Intel Inc.",
-                renderer="Intel Iris OpenGL Engine",
-                fix_hairline=True,
-            )
-
-            logger.info("✓ Driver configuré avec succès")
-            return driver
-
-        except Exception as exc:  # pragma: no cover - nécessite chrome
-            logger.error("✗ Erreur lors de la configuration du driver: %s", exc)
-            raise
+        return create_driver(headless=self.headless)
 
     def human_like_delay(self, min_sec: float = 2, max_sec: float = 5):
         """Délai aléatoire pour simuler un humain."""
