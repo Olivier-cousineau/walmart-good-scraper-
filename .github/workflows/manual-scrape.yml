@@ -36,11 +36,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Chrome
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: stable
           install-dependencies: true
           install-chromedriver: true
+
+      - name: Export Chrome paths
+        run: |
+          echo "CHROME_BINARY=${{ steps.setup-chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+          echo "CHROMEDRIVER_PATH=${{ steps.setup-chrome.outputs.chromedriver-path }}" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
