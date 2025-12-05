@@ -335,23 +335,75 @@ class WalmartCanadaScraper:
 
         return store_id, province, store_slug
 
-    def _normalize_product(self, raw: Dict, store_id: Optional[str], store_slug: str, province: str, promo_hint: str) -> Optional[Dict]:
+    def _detect_promo_type(self, raw: Dict, promo_hint: Optional[str]) -> Optional[str]:
+        """Déterminer si un produit est en rollback/clearance/deal."""
+
+        promo_sources = []
+        badges = raw.get("badges") or raw.get("tags") or raw.get("categoryTags") or []
+        if isinstance(badges, dict):
+            badges = list(badges.values())
+        if isinstance(badges, list):
+            promo_sources.extend([str(badge) for badge in badges])
+
+        potential_keys = [
+            "offerType",
+            "priceType",
+            "promoTag",
+            "badgeText",
+            "sellerBadges",
+            "availabilityStatus",
+        ]
+        for key in potential_keys:
+            value = raw.get(key)
+            if isinstance(value, (list, tuple)):
+                promo_sources.extend([str(v) for v in value])
+            elif value:
+                promo_sources.append(str(value))
+
+        promo_text = " ".join(promo_sources).lower()
+
+        if "rollback" in promo_text:
+            return "rollback"
+        if "clearance" in promo_text:
+            return "clearance"
+        if "deal" in promo_text or "special" in promo_text or "promo" in promo_text:
+            return "deal"
+
+        return promo_hint
+
+    def _normalize_product(
+        self, raw: Dict, store_id: Optional[str], store_slug: str, province: str, promo_type: Optional[str]
+    ) -> Optional[Dict]:
         """Normaliser les données produit renvoyées par l'API produit."""
 
-        title = raw.get("name") or raw.get("title") or raw.get("description")
-        product_id = raw.get("id") or raw.get("usItemId") or raw.get("sku") or raw.get("itemId")
+        if not promo_type:
+            return None
+
+        product_id = raw.get("usItemId") or raw.get("id") or raw.get("productId") or raw.get("sku") or raw.get("itemId")
+        sku = raw.get("sku") or product_id or ""
         product_url = raw.get("productPageUrl") or raw.get("canonicalUrl") or raw.get("canonicalUrlKey")
         if product_url and product_url.startswith("/"):
             product_url = f"https://www.walmart.ca{product_url}"
 
-        price_candidates = [
-            raw.get("price"),
-            raw.get("currentPrice"),
-            raw.get("sellingPrice"),
-            raw.get("primaryOffer"),
-            raw.get("priceInfo", {}).get("currentPrice"),
-            raw.get("offer", {}),
-        ]
+        title = raw.get("name") or raw.get("title") or raw.get("description") or raw.get("productName")
+
+        price_info = raw.get("priceInfo") or raw.get("priceinfo") or {}
+        price_candidates = []
+        if isinstance(price_info, dict):
+            price_candidates.extend(
+                [price_info.get("currentPrice"), price_info.get("price"), price_info.get("pricePerUnit"), price_info.get("primaryOffer")]
+            )
+
+        price_candidates.extend(
+            [
+                raw.get("price"),
+                raw.get("currentPrice"),
+                raw.get("sellingPrice"),
+                raw.get("primaryOffer"),
+                raw.get("offer", {}),
+                raw.get("priceDisplay"),
+            ]
+        )
 
         current_price = None
         original_price = None
@@ -367,37 +419,49 @@ class WalmartCanadaScraper:
                         or candidate.get("compareAtPrice")
                         or candidate.get("listPrice")
                     )
-            elif isinstance(candidate, (int, float, str)) and current_price is None:
+            elif isinstance(candidate, (int, float)) and current_price is None:
                 current_price = candidate
+            elif isinstance(candidate, str) and current_price is None:
+                try:
+                    current_price = float(candidate.replace("$", "").replace(",", ""))
+                except Exception:
+                    continue
 
-        badges = raw.get("badges") or raw.get("tags") or raw.get("categoryTags") or []
-        promo_type = promo_hint
-        if isinstance(badges, list):
-            badge_text = " ".join(str(badge) for badge in badges).lower()
-            if "rollback" in badge_text:
-                promo_type = "rollback"
-            elif "clearance" in badge_text:
-                promo_type = "clearance"
-            elif "deal" in badge_text or "special" in badge_text:
-                promo_type = "deal"
+        if original_price is None and isinstance(price_info, dict):
+            original_price = (
+                price_info.get("wasPrice")
+                or price_info.get("originalPrice")
+                or price_info.get("compareAtPrice")
+                or price_info.get("listPrice")
+            )
 
         if not title and not product_url:
             return None
+
+        discount_percent = None
+        if current_price and original_price:
+            try:
+                discount_percent = round((1 - float(current_price) / float(original_price)) * 100, 2)
+            except Exception:
+                discount_percent = None
 
         return {
             "store_id": store_id or store_slug,
             "store_slug": store_slug,
             "province": province,
             "product_id": product_id or "",
+            "sku": sku,
+            "name": title or "",
             "product_url": product_url or "",
-            "title": title or "",
             "current_price": current_price,
             "original_price": original_price,
+            "discount_percent": discount_percent,
             "promo_type": promo_type,
+            "store_quantity": raw.get("quantity") or raw.get("availableQuantity") or None,
         }
 
     def _extract_products_via_api(
-        self, store_id: Optional[str], store_slug: str, province: str, max_pages: int = 2
+        self, store_id: Optional[str], store_slug: str, province: str, store_url: str, max_pages: int = 2
     ) -> List[Dict]:
         """Récupérer les produits en promotion via l'API de recherche produit.
 
@@ -410,14 +474,34 @@ class WalmartCanadaScraper:
             logger.warning("Aucun store_id disponible pour l'extraction produit")
             return []
 
+        logger.info("Recherche des produits en LIQUIDATION (rollback/clearance/deal) pour storeId=%s...", store_id)
+
         session = requests.Session()
         session.trust_env = False
 
+        user_agent = None
+        try:
+            user_agent = self.driver.execute_script("return navigator.userAgent") if self.driver else None
+        except Exception:
+            user_agent = None
+
+        cookies = {}
+        if self.driver:
+            try:
+                cookies = {c["name"]: c["value"] for c in self.driver.get_cookies()}
+            except Exception:
+                cookies = {}
+
         headers = {
-            "User-Agent": self.get_random_user_agent(),
+            "User-Agent": user_agent or self.get_random_user_agent(),
             "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.walmart.ca/",
+            "Accept-Language": "en-CA,en;q=0.9,fr-CA,fr;q=0.8",
+            "Referer": store_url,
+            "X-Requested-With": "XMLHttpRequest",
         }
+        session.headers.update(headers)
+        for name, value in cookies.items():
+            session.cookies.set(name, value)
 
         search_queries = [
             ("rollback", "rollback"),
@@ -427,6 +511,7 @@ class WalmartCanadaScraper:
 
         all_products: List[Dict] = []
         seen_keys = set()
+        total_api_items = 0
 
         for query, promo_hint in search_queries:
             for page in range(1, max_pages + 1):
@@ -441,12 +526,7 @@ class WalmartCanadaScraper:
                 api_url = "https://www.walmart.ca/api/product-search/search"
                 logger.info("Appel API Walmart: %s - params=%s", api_url, params)
 
-                response = session.get(
-                    api_url,
-                    params=params,
-                    headers=headers,
-                    timeout=30,
-                )
+                response = session.get(api_url, params=params, timeout=30)
 
                 logger.info(
                     "Réponse API Walmart: %s - status=%s - len=%s",
@@ -457,7 +537,7 @@ class WalmartCanadaScraper:
 
                 should_save_debug = (
                     store_id
-                    and len(self.debug_api_saved_stores) < self.debug_api_save_limit
+                    and (response.status_code != 200 or len(self.debug_api_saved_stores) < self.debug_api_save_limit)
                     and store_id not in self.debug_api_saved_stores
                 )
 
@@ -472,27 +552,33 @@ class WalmartCanadaScraper:
                     logger.info("Réponse brute enregistrée pour debug: %s", debug_path)
 
                 if response.status_code != 200:
-                    logger.debug(
+                    logger.warning(
                         "Requête API produit échouée (status %s) pour store %s / query %s",
                         response.status_code,
                         store_id,
                         query,
                     )
-                    break
-
-                logger.info(
-                    "Chemin JSON utilisé pour extraire les produits: payload.get('items') or payload.get('results')"
-                )
+                    logger.debug("Corps de la réponse (extrait): %s", response.text[:300])
+                    continue
 
                 payload = response.json()
-                items = payload.get("items") or payload.get("results") or []
+                items = (
+                    payload.get("items")
+                    or payload.get("results")
+                    or payload.get("data", {}).get("items")
+                    or payload.get("data", {}).get("products")
+                    or []
+                )
+
+                total_api_items += len(items)
 
                 if not items:
                     logger.info("Aucun produit retourné pour la requête '%s' (page %s)", query, page)
                     break
 
                 for raw in items:
-                    normalized = self._normalize_product(raw, store_id, store_slug, province, promo_hint)
+                    promo_type = self._detect_promo_type(raw, promo_hint)
+                    normalized = self._normalize_product(raw, store_id, store_slug, province, promo_type)
                     if normalized:
                         key = (normalized.get("product_id"), normalized.get("product_url"))
                         if key not in seen_keys:
@@ -502,7 +588,12 @@ class WalmartCanadaScraper:
                 if len(items) < params["itemsPerPage"]:
                     break
 
-        logger.info("Trouvé %s produits via API", len(all_products))
+        logger.info(
+            "Store %s – produits totaux API: %s, produits en liquidation retenus: %s",
+            store_id,
+            total_api_items,
+            len(all_products),
+        )
         return all_products
 
     def scrape_store_page(self, store_url: str, retry: int = 0) -> Optional[Dict]:
@@ -548,7 +639,7 @@ class WalmartCanadaScraper:
                 data["store_name"] = "N/A"
 
             try:
-                api_products = self._extract_products_via_api(store_id, store_slug, province)
+                api_products = self._extract_products_via_api(store_id, store_slug, province, store_url)
                 data["products"].extend(api_products)
             except Exception as exc:
                 logger.warning("Erreur lors de l'extraction des produits via API: %s", exc)
