@@ -18,7 +18,7 @@ import shutil
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 from selenium import webdriver
@@ -134,6 +134,65 @@ def create_driver(headless: bool = True) -> Chrome:
     except Exception as e:
         logger.error(f"✗ Erreur lors de la configuration du driver: {e}", exc_info=True)
         raise
+
+
+def fetch_walmart_api_via_browser(driver, base_url, params, timeout: int = 30000):
+    """
+    Faire un appel à l'API Walmart via fetch() exécuté dans le contexte du navigateur.
+
+    Args:
+        driver: Selenium WebDriver déjà positionné sur la page magasin.
+        base_url: "https://www.walmart.ca/api/product-search/search".
+        params: dict des query params.
+        timeout: timeout JS en ms (par défaut 30s).
+
+    Returns:
+        (status_code, response_text) ou (None, None) en cas d'erreur.
+    """
+
+    query_string = urlencode(params)
+    full_url = f"{base_url}?{query_string}"
+
+    script = """
+    const callback = arguments[arguments.length - 1];
+    const url = arguments[0];
+    const timeoutMs = arguments[1];
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    fetch(url, {
+        method: 'GET',
+        credentials: 'include'
+    })
+    .then(async (resp) => {
+        const text = await resp.text();
+        clearTimeout(timeoutId);
+        callback(JSON.stringify({
+            ok: true,
+            status: resp.status,
+            body: text
+        }));
+    })
+    .catch((err) => {
+        clearTimeout(timeoutId);
+        callback(JSON.stringify({
+            ok: false,
+            error: String(err)
+        }));
+    });
+    """
+
+    try:
+        raw = driver.execute_async_script(script, full_url, timeout)
+        data = json.loads(raw)
+        if not data.get("ok"):
+            logger.warning("[fetch_walmart_api_via_browser] Erreur JS: %s", data.get("error"))
+            return None, None
+        return data.get("status"), data.get("body")
+    except Exception as e:
+        logger.warning("[fetch_walmart_api_via_browser] Exception Python: %s", e)
+        return None, None
 
 
 class WalmartCanadaScraper:
@@ -513,6 +572,8 @@ class WalmartCanadaScraper:
         seen_keys = set()
         total_api_items = 0
 
+        use_browser_api = False
+
         for query, promo_hint in search_queries:
             for page in range(1, max_pages + 1):
                 params = {
@@ -526,42 +587,81 @@ class WalmartCanadaScraper:
                 api_url = "https://www.walmart.ca/api/product-search/search"
                 logger.info("Appel API Walmart: %s - params=%s", api_url, params)
 
-                response = session.get(api_url, params=params, timeout=30)
+                response_status = None
+                response_text: Optional[str] = None
 
-                logger.info(
-                    "Réponse API Walmart: %s - status=%s - len=%s",
-                    response.url,
-                    response.status_code,
-                    len(response.text),
-                )
+                if use_browser_api:
+                    response_status, response_text = fetch_walmart_api_via_browser(
+                        self.driver, api_url, params
+                    )
+                    logger.info(
+                        "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
+                        f"{api_url}?{urlencode(params)}",
+                        response_status,
+                        len(response_text or ""),
+                    )
+                else:
+                    response = session.get(api_url, params=params, timeout=30)
+
+                    response_status = response.status_code
+                    response_text = response.text
+
+                    logger.info(
+                        "Réponse API Walmart: %s - status=%s - len=%s",
+                        response.url,
+                        response_status,
+                        len(response_text),
+                    )
+
+                    if 400 <= response_status < 500:
+                        logger.warning(
+                            "Requête API produit échouée (status %s) pour store %s / query %s",
+                            response_status,
+                            store_id,
+                            query,
+                        )
+                        logger.debug("Corps de la réponse (extrait): %s", response_text[:300])
+                        use_browser_api = True
+
+                        if self.driver:
+                            response_status, response_text = fetch_walmart_api_via_browser(
+                                self.driver, api_url, params
+                            )
+                            logger.info(
+                                "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
+                                f"{api_url}?{urlencode(params)}",
+                                response_status,
+                                len(response_text or ""),
+                            )
+                        else:
+                            logger.warning(
+                                "Impossible d'utiliser le fallback navigateur: driver non initialisé"
+                            )
 
                 should_save_debug = (
                     store_id
-                    and (response.status_code != 200 or len(self.debug_api_saved_stores) < self.debug_api_save_limit)
+                    and (response_status != 200 or len(self.debug_api_saved_stores) < self.debug_api_save_limit)
                     and store_id not in self.debug_api_saved_stores
                 )
 
-                if should_save_debug:
+                if should_save_debug and response_text is not None:
                     os.makedirs("debug_walmart", exist_ok=True)
                     debug_path = os.path.join(
                         "debug_walmart", f"store-{store_id}-q{query}-p{page}.json"
                     )
                     with open(debug_path, "w", encoding="utf-8") as debug_file:
-                        debug_file.write(response.text)
+                        debug_file.write(response_text)
                     self.debug_api_saved_stores.add(store_id)
                     logger.info("Réponse brute enregistrée pour debug: %s", debug_path)
 
-                if response.status_code != 200:
-                    logger.warning(
-                        "Requête API produit échouée (status %s) pour store %s / query %s",
-                        response.status_code,
-                        store_id,
-                        query,
-                    )
-                    logger.debug("Corps de la réponse (extrait): %s", response.text[:300])
+                if response_status != 200 or not response_text:
                     continue
 
-                payload = response.json()
+                try:
+                    payload = json.loads(response_text)
+                except Exception as exc:  # noqa: PERF203
+                    logger.warning("Impossible de parser la réponse API: %s", exc)
+                    continue
                 items = (
                     payload.get("items")
                     or payload.get("results")
