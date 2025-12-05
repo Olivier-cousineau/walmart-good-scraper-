@@ -236,14 +236,12 @@ class WalmartCanadaScraper:
         "Prince Edward Island": 2,
     }
 
-    # User agents réalistes modernes
+    # User agents réalistes modernes (mobile-first pour coller au front)
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     ]
 
     def __init__(
@@ -328,6 +326,21 @@ class WalmartCanadaScraper:
             return '"Not.A/Brand";v="99", "Firefox";v="121"'
         return '"Not.A/Brand";v="99"'
 
+    def _is_mobile_user_agent(self, user_agent: str) -> bool:
+        """Identifier si l'UA correspond à un navigateur mobile."""
+
+        lowered = user_agent.lower()
+        return "mobile" in lowered or "android" in lowered or "iphone" in lowered or "ipad" in lowered
+
+    def _sec_ch_ua_platform(self, user_agent: str) -> str:
+        """Platform sec-ch-ua cohérente avec l'UA."""
+
+        if "Android" in user_agent:
+            return '"Android"'
+        if "iPhone" in user_agent or "iPad" in user_agent:
+            return '"iOS"'
+        return '"Windows"'
+
     def _build_page_headers(self, user_agent: str, accept_language: str, referer: str) -> Dict[str, str]:
         """Headers réalistes pour une page HTML."""
 
@@ -344,8 +357,8 @@ class WalmartCanadaScraper:
             "Sec-Fetch-User": "?1",
             "Referer": referer,
             "sec-ch-ua": self._sec_ch_ua(user_agent),
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-mobile": "?1" if self._is_mobile_user_agent(user_agent) else "?0",
+            "sec-ch-ua-platform": self._sec_ch_ua_platform(user_agent),
         }
 
     def _build_api_headers(self, user_agent: str, accept_language: str, referer: str) -> Dict[str, str]:
@@ -363,8 +376,8 @@ class WalmartCanadaScraper:
             "Referer": referer,
             "Origin": "https://www.walmart.ca",
             "sec-ch-ua": self._sec_ch_ua(user_agent),
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-mobile": "?1" if self._is_mobile_user_agent(user_agent) else "?0",
+            "sec-ch-ua-platform": self._sec_ch_ua_platform(user_agent),
         }
 
     def _prime_cookies(
@@ -467,13 +480,23 @@ class WalmartCanadaScraper:
                 except Exception as exc:
                     logger.warning("Erreur lors de l'extraction CAPTCHA: %s", exc)
 
-            logger.warning("CAPTCHA non résolu - Attente de 30 secondes...")
-            time.sleep(30)
-            return True
+            logger.warning("CAPTCHA non résolu après tentatives automatiques/2Captcha")
+            return False
 
         except Exception as exc:
             logger.error("Erreur lors du traitement CAPTCHA: %s", exc)
             return False
+
+    def cooldown_after_captcha(self):
+        """Mettre l'IP/store au repos après un CAPTCHA non résolu."""
+
+        cooldown = random.uniform(30, 60)
+        logger.warning(
+            "CAPTCHA non résolu -> cooldown de %.1fs + rotation proxy avant de passer au store suivant",
+            cooldown,
+        )
+        time.sleep(cooldown)
+        self.rotate_proxy()
 
     def _extract_store_metadata(self, store_url: str):
         """Extraire store_id, province et slug depuis l'URL/page actuelle."""
@@ -711,12 +734,13 @@ class WalmartCanadaScraper:
         use_browser_api = False
 
         for query, promo_hint in search_queries:
-            for page in range(1, max_pages + 1):
+            page = 1
+            while page <= max_pages:
                 params = {
                     "page": page,
                     "query": query,
                     "storeId": store_id,
-                    "itemsPerPage": 48,
+                    "itemsPerPage": 32,
                     "lang": "en",
                 }
 
@@ -726,28 +750,52 @@ class WalmartCanadaScraper:
                 response_status = None
                 response_text: Optional[str] = None
 
-                if use_browser_api:
-                    response_status, response_text = fetch_walmart_api_via_browser(
-                        self.driver, api_url, params
-                    )
-                    logger.info(
-                        "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
-                        f"{api_url}?{urlencode(params)}",
-                        response_status,
-                        len(response_text or ""),
-                    )
-                else:
-                    response = session.get(api_url, params=params, timeout=30)
+                for attempt in range(2):
+                    if use_browser_api:
+                        response_status, response_text = fetch_walmart_api_via_browser(
+                            self.driver, api_url, params
+                        )
+                        logger.info(
+                            "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
+                            f"{api_url}?{urlencode(params)}",
+                            response_status,
+                            len(response_text or ""),
+                        )
+                    else:
+                        response = session.get(api_url, params=params, timeout=30)
 
-                    response_status = response.status_code
-                    response_text = response.text
+                        response_status = response.status_code
+                        response_text = response.text
 
-                    logger.info(
-                        "Réponse API Walmart: %s - status=%s - len=%s",
-                        response.url,
-                        response_status,
-                        len(response_text),
-                    )
+                        logger.info(
+                            "Réponse API Walmart: %s - status=%s - len=%s",
+                            response.url,
+                            response_status,
+                            len(response_text),
+                        )
+
+                    if response_status == 412:
+                        backoff = random.uniform(30, 60)
+                        logger.warning(
+                            "HTTP 412 détecté pour store %s (query=%s, page=%s) – backoff %.1fs (tentative %s/2)",
+                            store_id,
+                            query,
+                            page,
+                            backoff,
+                            attempt + 1,
+                        )
+                        time.sleep(backoff)
+
+                        if attempt == 1:
+                            logger.error(
+                                "HTTP 412 répété -> rotation proxy et arrêt des appels API sur ce store"
+                            )
+                            self.rotate_proxy()
+                            return all_products
+
+                        continue
+
+                    break
 
                 if response_status == 456:
                     self._mark_api_blocked(response_text, store_id, query, page)
@@ -795,6 +843,8 @@ class WalmartCanadaScraper:
                     logger.info("Réponse brute enregistrée pour debug: %s", debug_path)
 
                 if response_status != 200 or not response_text:
+                    page += 1
+                    self.human_like_delay(8, 15)
                     continue
 
                 try:
@@ -828,6 +878,9 @@ class WalmartCanadaScraper:
                 if len(items) < params["itemsPerPage"]:
                     break
 
+                page += 1
+                self.human_like_delay(8, 15)
+
         logger.info(
             "Store %s – produits totaux API: %s, produits en liquidation retenus: %s",
             store_id,
@@ -853,9 +906,8 @@ class WalmartCanadaScraper:
                 if captcha_elements:
                     logger.info("CAPTCHA détecté!")
                     if not self.handle_captcha():
-                        if retry < self.max_retries - 1:
-                            self.human_like_delay(5, 10)
-                            return self.scrape_store_page(store_url, retry + 1)
+                        logger.warning("CAPTCHA non résolu -> skip API product-search pour ce store")
+                        self.cooldown_after_captcha()
                         return None
             except Exception:
                 pass
