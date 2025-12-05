@@ -17,7 +17,7 @@ import re
 import shutil
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
 import requests
@@ -99,17 +99,15 @@ def _detect_chromedriver_binary() -> str:
     )
 
 
-def create_driver(headless: bool = True) -> Chrome:
+def create_driver(headless: bool = True, user_agent: Optional[str] = None, proxy: Optional[str] = None) -> Chrome:
     """Créer un driver Chrome compatible GitHub Actions avec Selenium classique."""
 
     try:
         options = Options()
 
-        # Garantir que le binaire Chrome installé par le workflow est utilisé
         chrome_binary = _detect_chrome_binary()
         options.binary_location = chrome_binary
 
-        # ---- FLAGS SPÉCIAUX POUR CI / DOCKER / GITHUB ACTIONS ----
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -118,7 +116,12 @@ def create_driver(headless: bool = True) -> Chrome:
         options.add_argument("--disable-dev-tools")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-setuid-sandbox")
-        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--window-size=1366,768")
+
+        if user_agent:
+            options.add_argument(f"--user-agent={user_agent}")
+        if proxy:
+            options.add_argument(f"--proxy-server={proxy}")
 
         logger.info("Création du driver Chrome (Selenium) pour Walmart Canada...")
 
@@ -127,6 +130,19 @@ def create_driver(headless: bool = True) -> Chrome:
 
         driver.set_page_load_timeout(60)
         driver.set_script_timeout(60)
+
+        if user_agent:
+            try:
+                driver.execute_cdp_cmd(
+                    "Network.setUserAgentOverride",
+                    {
+                        "userAgent": user_agent,
+                        "platform": "Windows",
+                        "acceptLanguage": "en-CA",
+                    },
+                )
+            except Exception:
+                logger.debug("Impossible d'ajuster l'UA via CDP (fallback sur options)")
 
         logger.info("✓ Driver Chrome initialisé avec succès.")
         return driver
@@ -255,6 +271,8 @@ class WalmartCanadaScraper:
         self.max_retries = max_retries
         self.driver: Optional[Chrome] = None
         self.current_proxy_index = 0
+        self.active_proxy: Optional[str] = None
+        self.proxy_profiles: Dict[str, Dict[str, str]] = {}
         self.session_start_time = datetime.now()
         self.retry_count = 0
         self.debug_api_save_limit = 5
@@ -270,15 +288,105 @@ class WalmartCanadaScraper:
     def rotate_proxy(self) -> Optional[str]:
         """Rotation du proxy depuis la liste."""
         if not self.proxy_list:
+            self.active_proxy = None
             return None
         proxy = self.proxy_list[self.current_proxy_index % len(self.proxy_list)]
         self.current_proxy_index += 1
+        self.active_proxy = proxy
         logger.debug(
-            f"Proxy utilisé: {proxy[:30]}..."
-            if len(proxy) > 30
-            else f"Proxy utilisé: {proxy}"
+            f"Proxy utilisé: {proxy[:30]}..." if len(proxy) > 30 else f"Proxy utilisé: {proxy}"
         )
         return proxy
+
+    def _ensure_proxy_profile(self, proxy: Optional[str]) -> Tuple[str, str]:
+        """Associer un profil (UA + locale) à un proxy donné."""
+
+        profile_key = proxy or "direct"
+        if profile_key not in self.proxy_profiles:
+            user_agent = self.get_random_user_agent()
+            accept_language = random.choice(
+                [
+                    "fr-CA,fr-FR;q=0.9,en-CA;q=0.8,en;q=0.7",
+                    "en-CA,en;q=0.9,fr-CA;q=0.8,fr;q=0.7",
+                ]
+            )
+            self.proxy_profiles[profile_key] = {
+                "user_agent": user_agent,
+                "accept_language": accept_language,
+            }
+        profile = self.proxy_profiles[profile_key]
+        return profile["user_agent"], profile["accept_language"]
+
+    def _sec_ch_ua(self, user_agent: str) -> str:
+        """Construire un header sec-ch-ua cohérent avec Chrome/Edge."""
+
+        if "Edg/" in user_agent:
+            return '"Not/A)Brand";v="99", "Microsoft Edge";v="120", "Chromium";v="120"'
+        if "Chrome/" in user_agent:
+            return '"Not.A/Brand";v="99", "Google Chrome";v="120", "Chromium";v="120"'
+        if "Firefox" in user_agent:
+            return '"Not.A/Brand";v="99", "Firefox";v="121"'
+        return '"Not.A/Brand";v="99"'
+
+    def _build_page_headers(self, user_agent: str, accept_language: str, referer: str) -> Dict[str, str]:
+        """Headers réalistes pour une page HTML."""
+
+        return {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": accept_language,
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Referer": referer,
+            "sec-ch-ua": self._sec_ch_ua(user_agent),
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
+
+    def _build_api_headers(self, user_agent: str, accept_language: str, referer: str) -> Dict[str, str]:
+        """Headers réalistes pour l'API JSON Walmart."""
+
+        return {
+            "User-Agent": user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": accept_language,
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Referer": referer,
+            "Origin": "https://www.walmart.ca",
+            "sec-ch-ua": self._sec_ch_ua(user_agent),
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
+
+    def _prime_cookies(
+        self, session: requests.Session, store_url: str, user_agent: str, accept_language: str
+    ) -> None:
+        """Récupérer des cookies initiaux via le navigateur ou un GET HTML."""
+
+        if self.driver:
+            try:
+                for cookie in self.driver.get_cookies():
+                    session.cookies.set(cookie["name"], cookie["value"])
+                return
+            except Exception:
+                logger.debug("Impossible de copier les cookies du navigateur; fallback HTTP")
+
+        bootstrap_headers = self._build_page_headers(user_agent, accept_language, "https://www.walmart.ca/")
+
+        try:
+            session.get("https://www.walmart.ca/", headers=bootstrap_headers, timeout=20)
+            session.get(store_url, headers=bootstrap_headers, timeout=20)
+        except Exception as exc:
+            logger.debug("Échec du bootstrap cookies: %s", exc)
 
     def get_random_user_agent(self) -> str:
         """Retourner un user agent aléatoire."""
@@ -287,7 +395,14 @@ class WalmartCanadaScraper:
     def setup_driver(self) -> Chrome:
         """Configurer le driver Selenium compatible CI."""
 
-        return create_driver(headless=self.headless)
+        proxy = self.active_proxy if self.active_proxy is not None else self.rotate_proxy()
+        user_agent, _ = self._ensure_proxy_profile(proxy)
+
+        return create_driver(
+            headless=self.headless,
+            user_agent=user_agent,
+            proxy=proxy,
+        )
 
     def human_like_delay(self, min_sec: float = 2, max_sec: float = 5):
         """Délai aléatoire pour simuler un humain."""
@@ -544,6 +659,9 @@ class WalmartCanadaScraper:
         except Exception as exc:  # noqa: PERF203
             logger.warning("Impossible d'enregistrer le body de la réponse 456: %s", exc)
 
+        logger.info("Rotation du proxy et des entêtes après blocage 456")
+        self.rotate_proxy()
+
     def _extract_products_via_api(
         self, store_id: Optional[str], store_slug: str, province: str, store_url: str, max_pages: int = 2
     ) -> List[Dict]:
@@ -570,29 +688,15 @@ class WalmartCanadaScraper:
         session = requests.Session()
         session.trust_env = False
 
-        user_agent = None
-        try:
-            user_agent = self.driver.execute_script("return navigator.userAgent") if self.driver else None
-        except Exception:
-            user_agent = None
+        proxy = self.active_proxy
+        user_agent, accept_language = self._ensure_proxy_profile(proxy)
 
-        cookies = {}
-        if self.driver:
-            try:
-                cookies = {c["name"]: c["value"] for c in self.driver.get_cookies()}
-            except Exception:
-                cookies = {}
+        if proxy:
+            session.proxies.update({"http": proxy, "https": proxy})
 
-        headers = {
-            "User-Agent": user_agent or self.get_random_user_agent(),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-CA,en;q=0.9,fr-CA,fr;q=0.8",
-            "Referer": store_url,
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        headers = self._build_api_headers(user_agent, accept_language, store_url)
         session.headers.update(headers)
-        for name, value in cookies.items():
-            session.cookies.set(name, value)
+        self._prime_cookies(session, store_url, user_agent, accept_language)
 
         search_queries = [
             ("rollback", "rollback"),
@@ -839,6 +943,7 @@ class WalmartCanadaScraper:
                                 self.driver.quit()
                             except Exception:
                                 pass
+                            self.rotate_proxy()
                             self.driver = self.setup_driver()
                             logger.info("└─ Proxy rotationné ✓")
                             self.human_like_delay(3, 6)
