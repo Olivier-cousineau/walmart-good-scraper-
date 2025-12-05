@@ -259,6 +259,7 @@ class WalmartCanadaScraper:
         self.retry_count = 0
         self.debug_api_save_limit = 5
         self.debug_api_saved_stores = set()
+        self.api_blocked = False
 
         logger.info(
             "Scraper initialisé - Proxies: %s, CAPTCHA API: %s",
@@ -519,6 +520,30 @@ class WalmartCanadaScraper:
             "store_quantity": raw.get("quantity") or raw.get("availableQuantity") or None,
         }
 
+    def _mark_api_blocked(self, response_body: Optional[str], store_id: Optional[str], query: str, page: int):
+        """Détecter un blocage API (HTTP 456) et sauvegarder le body pour debug."""
+
+        if self.api_blocked:
+            return
+
+        self.api_blocked = True
+        logger.error(
+            "Blocage API détecté (456) pour store %s sur la requête '%s' page %s. Arrêt des appels API.",
+            store_id,
+            query,
+            page,
+        )
+
+        try:
+            os.makedirs("debug_walmart", exist_ok=True)
+            debug_filename = f"api-blocked-store-{store_id or 'unknown'}-q{query}-p{page}.json"
+            debug_path = os.path.join("debug_walmart", debug_filename)
+            with open(debug_path, "w", encoding="utf-8") as debug_file:
+                debug_file.write(response_body or "")
+            logger.info("Corps de la réponse 456 enregistré: %s", debug_path)
+        except Exception as exc:  # noqa: PERF203
+            logger.warning("Impossible d'enregistrer le body de la réponse 456: %s", exc)
+
     def _extract_products_via_api(
         self, store_id: Optional[str], store_slug: str, province: str, store_url: str, max_pages: int = 2
     ) -> List[Dict]:
@@ -531,6 +556,13 @@ class WalmartCanadaScraper:
 
         if not store_id:
             logger.warning("Aucun store_id disponible pour l'extraction produit")
+            return []
+
+        if self.api_blocked:
+            logger.warning(
+                "API Walmart déjà signalée comme bloquée (456). Skip storeId=%s pour accélérer la boucle.",
+                store_id,
+            )
             return []
 
         logger.info("Recherche des produits en LIQUIDATION (rollback/clearance/deal) pour storeId=%s...", store_id)
@@ -613,30 +645,34 @@ class WalmartCanadaScraper:
                         len(response_text),
                     )
 
-                    if 400 <= response_status < 500:
-                        logger.warning(
-                            "Requête API produit échouée (status %s) pour store %s / query %s",
-                            response_status,
-                            store_id,
-                            query,
-                        )
-                        logger.debug("Corps de la réponse (extrait): %s", response_text[:300])
-                        use_browser_api = True
+                if response_status == 456:
+                    self._mark_api_blocked(response_text, store_id, query, page)
+                    return all_products
 
-                        if self.driver:
-                            response_status, response_text = fetch_walmart_api_via_browser(
-                                self.driver, api_url, params
-                            )
-                            logger.info(
-                                "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
-                                f"{api_url}?{urlencode(params)}",
-                                response_status,
-                                len(response_text or ""),
-                            )
-                        else:
-                            logger.warning(
-                                "Impossible d'utiliser le fallback navigateur: driver non initialisé"
-                            )
+                if 400 <= response_status < 500:
+                    logger.warning(
+                        "Requête API produit échouée (status %s) pour store %s / query %s",
+                        response_status,
+                        store_id,
+                        query,
+                    )
+                    logger.debug("Corps de la réponse (extrait): %s", response_text[:300])
+                    use_browser_api = True
+
+                    if self.driver:
+                        response_status, response_text = fetch_walmart_api_via_browser(
+                            self.driver, api_url, params
+                        )
+                        logger.info(
+                            "Réponse API Walmart via navigateur: %s - status=%s - len=%s",
+                            f"{api_url}?{urlencode(params)}",
+                            response_status,
+                            len(response_text or ""),
+                        )
+                    else:
+                        logger.warning(
+                            "Impossible d'utiliser le fallback navigateur: driver non initialisé"
+                        )
 
                 should_save_debug = (
                     store_id
