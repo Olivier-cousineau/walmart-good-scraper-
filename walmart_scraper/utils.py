@@ -7,10 +7,16 @@ from typing import Any, Dict, Optional
 import httpx
 from loguru import logger as log
 from parsel import Selector
-from scrapfly import ScrapeConfig, ScrapflyClient
+try:
+    from scrapfly import ScrapeConfig, ScrapflyClient
+except ImportError:
+    ScrapflyClient = None
+    ScrapeConfig = None
 
 SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY")
-SCRAPFLY_CLIENT = ScrapflyClient(key=SCRAPFLY_KEY) if SCRAPFLY_KEY else None
+SCRAPFLY_CLIENT = (
+    ScrapflyClient(key=SCRAPFLY_KEY) if SCRAPFLY_KEY and ScrapflyClient is not None else None
+)
 
 MOBILE_UAS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
