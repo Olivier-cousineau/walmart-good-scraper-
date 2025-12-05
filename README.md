@@ -29,6 +29,12 @@ Arguments disponibles :
 - `--headless` / `--no-headless` : active/désactive le mode headless (activé par défaut pour les workflows).
 - `--max-retries` : nombre de tentatives par page en cas d'erreur.
 
+## Durcissement anti-bot
+
+- Le scraper crée un profil (User-Agent + Accept-Language) par proxy et applique ces entêtes cohérents aussi bien dans Selenium que pour les appels HTTP.
+- Les cookies sont amorcés automatiquement (recopie du navigateur ou préchargement de la home) avant toute requête API.
+- Les proxies résidentiels sont rotés régulièrement (toutes les 10 boutiques ou après un HTTP 456) pour limiter le profilage IP.
+
 ## Workflow GitHub Actions manuel
 
 Un workflow déclenchable manuellement (`Manual Walmart Canada scrape`) est disponible dans `.github/workflows/manual-scrape.yml`.
