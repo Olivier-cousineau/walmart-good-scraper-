@@ -18,7 +18,7 @@ class WalmartSearchScraper:
     async def fetch_search_page(self, query: str, page: int) -> List[Dict[str, Any]]:
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://www.walmart.com/search?q={encoded_query}&page={page}"
-        html = await fetch_html(self._client, url)
+        html = await fetch_html(url, self._client)
         if not html:
             logger.error(f"No HTML retrieved for search page {page}")
             return []
