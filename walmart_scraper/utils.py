@@ -1,38 +1,108 @@
 import asyncio
 import json
+import os
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
-from loguru import logger
+from loguru import logger as log
 from parsel import Selector
+from scrapfly import ScrapeConfig, ScrapflyClient
 
-MOBILE_USER_AGENTS: List[str] = [
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1",
+SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY")
+SCRAPFLY_CLIENT = ScrapflyClient(key=SCRAPFLY_KEY) if SCRAPFLY_KEY else None
+
+MOBILE_UAS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; SM-G996B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 ]
 
-BLOCK_STRINGS = ["Robot or human", "blocked", "blocked your request"]
+BLOCK_MARKERS = [
+    "Robot or human",
+    "captcha",
+    "blocked",
+    "/blocked?",
+    "Request blocked",
+]
 
 
-def build_headers(user_agent: str) -> Dict[str, str]:
-    return {
-        "User-Agent": user_agent,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-    }
+async def fetch_html(
+    url: str,
+    client: httpx.AsyncClient | None = None,
+    max_attempts: int = 3,
+) -> str | None:
+    """
+    Fetch HTML from a Walmart URL with retries.
 
+    - Si SCRAPFLY_KEY est défini -> utilise ScrapFly (bypass anti-bot).
+    - Sinon -> fallback sur httpx + user-agent mobile + petits délais.
+    """
+    for attempt in range(1, max_attempts + 1):
+        ua = random.choice(MOBILE_UAS)
+        log.debug(f"Fetching {url} (attempt {attempt}) with UA: {ua}")
 
-def has_next_data(html: str) -> bool:
-    return "__NEXT_DATA__" in html
+        try:
+            # --- Mode ScrapFly (prioritaire si clé dispo) ---
+            if SCRAPFLY_CLIENT:
+                loop = asyncio.get_running_loop()
+
+                def _scrapfly_call():
+                    return SCRAPFLY_CLIENT.scrape(
+                        ScrapeConfig(
+                            url=url,
+                            asp=True,      # anti-scraping bypass
+                            country="US",  # proxy US
+                            render_js=False,
+                            headers={"user-agent": ua},
+                        )
+                    )
+
+                result = await loop.run_in_executor(None, _scrapfly_call)
+                status = result.response_status
+                text = result.content
+
+            # --- Mode httpx (fallback sans ScrapFly) ---
+            else:
+                if client is None:
+                    raise RuntimeError(
+                        "httpx.AsyncClient is required when SCRAPFLY_KEY is not set"
+                    )
+
+                resp = await client.get(
+                    url,
+                    headers={"user-agent": ua},
+                    timeout=30,
+                )
+                status = resp.status_code
+                text = resp.text
+
+            # --- Analyse du blocage ---
+            if status in (403, 429, 456, 503) or any(m.lower() in text.lower() for m in BLOCK_MARKERS):
+                log.warning(
+                    f"Blocked or invalid response for {url} on attempt {attempt}. "
+                    f"status={status}, snippet={text[:200]!r}"
+                )
+                await asyncio.sleep(random.uniform(1.5, 4.5))
+                continue
+
+            if "__NEXT_DATA__" not in text:
+                log.warning(
+                    f"No __NEXT_DATA__ in response from {url} on attempt {attempt}. "
+                    f"status={status}, snippet={text[:200]!r}"
+                )
+                await asyncio.sleep(random.uniform(1.5, 4.5))
+                continue
+
+            # ✅ Réponse valide
+            return text
+
+        except Exception as e:
+            log.error(f"Error fetching {url} on attempt {attempt}: {e}")
+            await asyncio.sleep(random.uniform(1.5, 4.5))
+
+    log.error(f"Failed to fetch valid content from {url} after {max_attempts} attempts")
+    return None
 
 
 def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
@@ -43,48 +113,8 @@ def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(raw_json)
     except json.JSONDecodeError:
-        logger.error("Failed to decode __NEXT_DATA__ JSON")
+        log.error("Failed to decode __NEXT_DATA__ JSON")
         return None
-
-
-def is_blocked(response: httpx.Response, html: str) -> bool:
-    if response.status_code == 456:
-        return True
-    lower_html = html.lower()
-    for pattern in BLOCK_STRINGS:
-        if pattern.lower() in lower_html:
-            return True
-    return not has_next_data(html)
-
-
-async def fetch_html(
-    client: httpx.AsyncClient,
-    url: str,
-    max_retries: int = 3,
-    min_delay: float = 1.5,
-    max_delay: float = 4.5,
-) -> Optional[str]:
-    for attempt in range(1, max_retries + 1):
-        user_agent = random.choice(MOBILE_USER_AGENTS)
-        headers = build_headers(user_agent)
-        logger.debug(f"Fetching {url} (attempt {attempt}) with UA: {user_agent}")
-        try:
-            response = await client.get(url, headers=headers, timeout=30)
-            html = response.text
-        except httpx.HTTPError as exc:
-            logger.warning(f"HTTP error fetching {url}: {exc}")
-            html = ""
-
-        if html and not is_blocked(response if 'response' in locals() else httpx.Response(0), html):
-            return html
-
-        logger.warning(
-            f"Blocked or invalid response for {url} on attempt {attempt}. Retrying after delay."
-        )
-        await asyncio.sleep(random.uniform(min_delay, max_delay))
-
-    logger.error(f"Failed to fetch valid content from {url} after {max_retries} attempts")
-    return None
 
 
 def ensure_product_url(url: str) -> str:

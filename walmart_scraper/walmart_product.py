@@ -17,7 +17,7 @@ class WalmartProductScraper:
 
     async def fetch_product(self, url: str) -> Optional[Dict[str, Any]]:
         async with self._semaphore:
-            html = await fetch_html(self._client, url)
+            html = await fetch_html(url, self._client)
             if not html:
                 logger.error(f"No HTML retrieved for product {url}")
                 return None
