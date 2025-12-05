@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+walmart_scraper/output/*.json
+walmart_scraper/output/*.csv
