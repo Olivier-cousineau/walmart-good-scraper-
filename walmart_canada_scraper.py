@@ -198,6 +198,8 @@ class WalmartCanadaScraper:
         self.current_proxy_index = 0
         self.session_start_time = datetime.now()
         self.retry_count = 0
+        self.debug_api_save_limit = 5
+        self.debug_api_saved_stores = set()
 
         logger.info(
             "Scraper initialisé - Proxies: %s, CAPTCHA API: %s",
@@ -436,12 +438,38 @@ class WalmartCanadaScraper:
                     "lang": "en",
                 }
 
+                api_url = "https://www.walmart.ca/api/product-search/search"
+                logger.info("Appel API Walmart: %s - params=%s", api_url, params)
+
                 response = session.get(
-                    "https://www.walmart.ca/api/product-search/search",
+                    api_url,
                     params=params,
                     headers=headers,
                     timeout=30,
                 )
+
+                logger.info(
+                    "Réponse API Walmart: %s - status=%s - len=%s",
+                    response.url,
+                    response.status_code,
+                    len(response.text),
+                )
+
+                should_save_debug = (
+                    store_id
+                    and len(self.debug_api_saved_stores) < self.debug_api_save_limit
+                    and store_id not in self.debug_api_saved_stores
+                )
+
+                if should_save_debug:
+                    os.makedirs("debug_walmart", exist_ok=True)
+                    debug_path = os.path.join(
+                        "debug_walmart", f"store-{store_id}-q{query}-p{page}.json"
+                    )
+                    with open(debug_path, "w", encoding="utf-8") as debug_file:
+                        debug_file.write(response.text)
+                    self.debug_api_saved_stores.add(store_id)
+                    logger.info("Réponse brute enregistrée pour debug: %s", debug_path)
 
                 if response.status_code != 200:
                     logger.debug(
@@ -451,6 +479,10 @@ class WalmartCanadaScraper:
                         query,
                     )
                     break
+
+                logger.info(
+                    "Chemin JSON utilisé pour extraire les produits: payload.get('items') or payload.get('results')"
+                )
 
                 payload = response.json()
                 items = payload.get("items") or payload.get("results") or []
